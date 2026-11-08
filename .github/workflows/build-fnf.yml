@@ -1,0 +1,207 @@
+# FNF: ChatGPT Version — ZIP-only GitHub Actions builder.
+# Put this file at .github/workflows/build-fnf.yml in your repository.
+# Put fnf-chatgpt-version-source.zip at the repository ROOT; no extracted source folders required.
+name: Build FNF ChatGPT Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build output'
+        type: choice
+        required: true
+        default: android
+        options:
+          - android
+          - html5
+  push:
+    paths:
+      - 'fnf-chatgpt-version-source.zip'
+      - '.github/workflows/build-fnf.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fnf-zip-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ inputs.target || 'android' }} from ZIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      GAME_DIR: FNF-ChatGPT-Version
+      BUILD_TARGET: ${{ inputs.target || 'android' }}
+      HAXELIB_ROOT: ${{ github.workspace }}/FNF-ChatGPT-Version/.haxelib
+
+    steps:
+      - name: Checkout the repository (ZIP only)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Unpack and validate the game ZIP
+        run: |
+          set -euo pipefail
+          test -f fnf-chatgpt-version-source.zip || { echo 'Missing fnf-chatgpt-version-source.zip at repository root'; exit 1; }
+          unzip -tq fnf-chatgpt-version-source.zip
+          unzip -q fnf-chatgpt-version-source.zip
+          test -f "$GAME_DIR/project.hxp" || { echo 'The ZIP must contain FNF-ChatGPT-Version/project.hxp'; exit 1; }
+          test -f "$GAME_DIR/hmm.json" || { echo 'Missing hmm.json'; exit 1; }
+          python3 "$GAME_DIR/tests/test_chatgpt_patch.py"
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git git-lfs unzip zip build-essential pkg-config cmake python3 \
+            libx11-dev libxi-dev libxext-dev libxinerama-dev libxrandr-dev \
+            libxcursor-dev libgl1-mesa-dev libglu1-mesa-dev \
+            libasound2-dev libpulse-dev libvlc-dev libvlccore-dev
+
+      # Game assets are stored in a separate source repository. They are NOT in the uploaded ZIP.
+      # Check upstream assets/LICENSE.md before sharing any compiled output.
+      - name: Fetch required game assets
+        working-directory: ${{ env.GAME_DIR }}
+        run: |
+          set -euo pipefail
+          rm -rf assets
+          git lfs install --skip-repo
+          git clone --depth 1 --single-branch --branch main \
+            https://github.com/FunkinCrew/funkin.assets.git assets
+          git -C assets lfs pull
+          test -d assets/preload || { echo 'Expected assets/preload folder is missing'; exit 1; }
+          echo "Asset commit: $(git -C assets rev-parse HEAD)"
+          echo 'IMPORTANT: The assets have a separate proprietary licence. Do not publish this build without permission.'
+
+      - name: Set up Haxe 4.3.7
+        uses: FunkinCrew/ci-haxe@v3.2.7
+        with:
+          haxe-version: '4.3.7'
+
+      - name: Set up Java 17
+        if: env.BUILD_TARGET == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: env.BUILD_TARGET == 'android'
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK and supported NDK
+        if: env.BUILD_TARGET == 'android'
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            'build-tools;35.0.0' \
+            'platforms;android-29' \
+            'platforms;android-35' \
+            'ndk;29.0.13113456'
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/29.0.13113456" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.13113456" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Cache pinned Haxe dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HAXELIB_ROOT }}
+          key: fnf-hmm-${{ runner.os }}-${{ hashFiles('FNF-ChatGPT-Version/hmm.json') }}
+
+      - name: Install the project's Haxe libraries
+        working-directory: ${{ env.GAME_DIR }}
+        run: |
+          set -euo pipefail
+          # Funkin's pinned libraries need the upstream patched dependency resolver.
+          haxelib --global --never install haxelib 4.1.0
+          haxelib --global --never git haxelib https://github.com/FunkinCrew/haxelib.git funkin-patches --skip-dependencies
+          haxelib --global --never git hmm https://github.com/FunkinCrew/hmm.git funkin-patches
+          mkdir -p "$HAXELIB_ROOT"
+          haxelib --never newrepo
+          haxelib --global run hmm install -q
+          haxelib list
+          if test -f .haxelib/hxcpp/git/tools/hxcpp/compile.hxml; then
+            (cd .haxelib/hxcpp/git/tools/hxcpp && haxe compile.hxml)
+          fi
+
+      - name: Configure Lime and compile Android APK
+        if: env.BUILD_TARGET == 'android'
+        working-directory: ${{ env.GAME_DIR }}
+        run: |
+          set -euo pipefail
+          haxelib run lime config ANDROID_SDK "$ANDROID_SDK_ROOT"
+          haxelib run lime config ANDROID_NDK_ROOT "$ANDROID_NDK_ROOT"
+          haxelib run lime config JAVA_HOME "$JAVA_HOME"
+          haxelib run lime config ANDROID_SETUP true
+          haxelib run lime rebuild android
+          haxelib run lime build android -release -verbose
+
+      - name: Compile HTML5 build
+        if: env.BUILD_TARGET == 'html5'
+        working-directory: ${{ env.GAME_DIR }}
+        run: |
+          set -euo pipefail
+          haxelib run lime build html5 -release -verbose
+          test -f export/release/html5/bin/index.html
+
+      - name: Package installable Android APK
+        if: env.BUILD_TARGET == 'android'
+        working-directory: ${{ env.GAME_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../fnf-artifact
+          mapfile -d '' apks < <(find export -type f -name '*.apk' -print0)
+          if ((${#apks[@]} == 0)); then
+            echo 'No APK was produced by Lime:'
+            find export -type f | tail -100
+            exit 1
+          fi
+          apk="${apks[0]}"
+          echo "APK found: $apk"
+          tools="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          # CI-only ephemeral signing key. The generated APK is installable, but not
+          # suitable for publishing or updating across runs (each run has a new key).
+          if "$tools/apksigner" verify "$apk" >/dev/null 2>&1; then
+            cp "$apk" ../fnf-artifact/FNF-ChatGPT-Version.apk
+          else
+            "$tools/zipalign" -f -p 4 "$apk" ../fnf-artifact/aligned.apk
+            keytool -genkeypair -noprompt \
+              -keystore ../fnf-artifact/ci-temporary.jks \
+              -storepass 'temporary-ci-only' -keypass 'temporary-ci-only' \
+              -alias ci -keyalg RSA -keysize 3072 -validity 30 \
+              -dname 'CN=FNF Community CI, OU=Personal Builds, O=Unofficial, C=GB'
+            "$tools/apksigner" sign \
+              --ks ../fnf-artifact/ci-temporary.jks \
+              --ks-key-alias ci \
+              --ks-pass pass:temporary-ci-only \
+              --key-pass pass:temporary-ci-only \
+              --out ../fnf-artifact/FNF-ChatGPT-Version.apk \
+              ../fnf-artifact/aligned.apk
+            rm -f ../fnf-artifact/ci-temporary.jks ../fnf-artifact/aligned.apk
+          fi
+          "$tools/apksigner" verify --verbose ../fnf-artifact/FNF-ChatGPT-Version.apk
+          ls -lh ../fnf-artifact/FNF-ChatGPT-Version.apk
+
+      - name: Upload APK artifact
+        if: env.BUILD_TARGET == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FNF-ChatGPT-Version-Android-APK
+          path: fnf-artifact/FNF-ChatGPT-Version.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload HTML5 artifact
+        if: env.BUILD_TARGET == 'html5'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FNF-ChatGPT-Version-HTML5
+          path: FNF-ChatGPT-Version/export/release/html5/bin/
+          if-no-files-found: error
+          retention-days: 14
